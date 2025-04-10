@@ -122,7 +122,6 @@ class SharedStorageConnector(KVConnectorBase_V1):
             dst_kv_cache_layer = dst_kv_cache_layer.reshape(
                 2, num_pages * page_size, -1)
             dst_kv_cache_layer[:, slot_mapping, ...] = src_kv_cache
-            dst_kv_cache_layer.reshape(dst_kv_cache_layer_shape)
 
         # Get the metadata
         metadata: KVConnectorMetadata = \
