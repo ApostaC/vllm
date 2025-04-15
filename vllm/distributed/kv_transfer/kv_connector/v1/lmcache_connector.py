@@ -389,9 +389,13 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
 
         token_ids = torch.tensor(request.prompt_token_ids)
         num_external_hit_tokens = self.lookup_client.lookup(token_ids)
-        logger.info("Num external hit tokens: %d", num_external_hit_tokens)
+        #logger.info("Num external hit tokens: %d", num_external_hit_tokens)
 
         need_to_allocate = num_external_hit_tokens - num_computed_tokens
+        logger.info(
+            "Reqid %s, total tokens %d, "
+            "LMCache hit tokens %d, need to load %d", request.request_id,
+            request.num_tokens, num_external_hit_tokens, need_to_allocate)
         if need_to_allocate <= 0:
             return 0
         self.load_specs[request.request_id] = LoadSpec(
