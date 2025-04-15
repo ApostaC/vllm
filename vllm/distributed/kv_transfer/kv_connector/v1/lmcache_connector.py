@@ -161,13 +161,18 @@ class ReqMeta:
         # Therefore, we need to use min(tokens_in_request, tokens_in_blocks)
         # to determine the number of tokens for connector to use.
 
-        full_token_ids = req_tokens.full_token_ids
+        if hasattr(request, "prompt_token_ids"):
+            token_ids = request.prompt_token_ids
+        else:
+            token_ids_len = len(request.new_token_ids) + \
+                request.num_computed_tokens
+            token_ids = req_tokens.full_token_ids[:token_ids_len]
         if len(req_tokens.decode_tokens) > 0 and \
-                len(full_token_ids) % chunk_size != 0:
+                len(token_ids) % chunk_size != 0:
             # skip store if the number of tokens is not aligned 
             # with lmcache chunk size
             return None
-        token_ids = torch.tensor(full_token_ids)
+        token_ids = torch.tensor(token_ids)
         if hasattr(request, "block_ids"):
             num_blocks = len(request.block_ids)
             block_ids = torch.Tensor(request.block_ids)
