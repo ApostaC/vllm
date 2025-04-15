@@ -118,7 +118,7 @@ def main(args):
     warmup_prompts = [
         "This is warm up request " + str(i) + \
                 ' '.join(['hi'] * args.document_length)
-        for i in range(args.num_documents)]
+        for i in range(5)]
 
     # Create the LLM engine
     engine_args = EngineArgs.from_cli_args(args)

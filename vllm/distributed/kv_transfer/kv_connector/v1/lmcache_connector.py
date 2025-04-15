@@ -122,7 +122,24 @@ class LoadSpec:
     # Whether the scheduler allow us to load the tokens
     can_load: bool
 
-
+@dataclass
+class TokensTracker:
+    # prompt tokens
+    prompt_tokens: list[int]
+    # decode tokens
+    decode_tokens: list[int]
+    
+    def update(
+        self, request: "Request") -> None:
+        """Update the token ids tracker."""
+        
+        if request.num_computed_tokens >= len(self.prompt_tokens):
+            self.decode_tokens.extend(request.new_token_ids)
+    
+    @property
+    def full_token_ids(self) -> list[int]:
+        """Get the full token ids."""
+        return self.prompt_tokens + self.decode_tokens
 @dataclass
 class ReqMeta:
     # Request tokens
@@ -135,31 +152,46 @@ class ReqMeta:
     @staticmethod
     def from_request(request: "Request",
                      block_size: int,
-                     load_spec: Optional[LoadSpec] = None) -> "ReqMeta":
+                     req_tokens: TokensTracker,
+                     chunk_size: int = 256,
+                     load_spec: Optional[LoadSpec] = None) -> Optional["ReqMeta"]:
         # NOTE: be careful! The scheduler may not schedule all of the tokens
         # in the request. And the allocated blocks could also be more than
         # the number of tokens in the request.
         # Therefore, we need to use min(tokens_in_request, tokens_in_blocks)
         # to determine the number of tokens for connector to use.
-        token_ids = torch.tensor(request.prompt_token_ids)
-        num_blocks = len(request.block_ids)
+
+        full_token_ids = req_tokens.full_token_ids
+        if len(req_tokens.decode_tokens) > 0 and \
+                len(full_token_ids) % chunk_size != 0:
+            # skip store if the number of tokens is not aligned 
+            # with lmcache chunk size
+            return None
+        token_ids = torch.tensor(full_token_ids)
+        if hasattr(request, "block_ids"):
+            num_blocks = len(request.block_ids)
+            block_ids = torch.Tensor(request.block_ids)
+        else:
+            num_blocks = len(request.new_block_ids)
+            block_ids = torch.Tensor(request.new_block_ids)
         valid_num_tokens = min(len(token_ids), num_blocks * block_size)
         token_ids = token_ids[:valid_num_tokens]
-
         # Extract slot mapping from block ids
-        block_ids = torch.Tensor(request.block_ids)
         num_blocks = block_ids.shape[0]
         block_offsets = torch.arange(0, block_size)
         slot_mapping = block_offsets.reshape((1, block_size)) + \
                 block_ids.reshape((num_blocks, 1)) * block_size
         slot_mapping = slot_mapping.flatten()[:valid_num_tokens].long()
-        if len(slot_mapping) != len(token_ids):
+        slot_mapping_full = torch.full(
+            (len(token_ids),), -1, dtype=torch.long)
+        slot_mapping_full[-valid_num_tokens:] = slot_mapping
+        if len(slot_mapping_full) != len(token_ids):
             logger.error("Slot mapping should be the same length as token ids")
             logger.error("Block ids: %s", str(block_ids))
             logger.error("Num blocks: %d", num_blocks)
             logger.error("Num tokens: %d", valid_num_tokens)
-            logger.error("Slot mapping: %s", str(slot_mapping))
-            logger.error("Slot mapping len: %s", len(slot_mapping))
+            logger.error("Slot mapping: %s", str(slot_mapping_full))
+            logger.error("Slot mapping len: %s", len(slot_mapping_full))
 
         if load_spec is not None and load_spec.can_load:
             logger.debug("Scheduled to load %d tokens for request %s",
@@ -168,7 +200,7 @@ class ReqMeta:
             # Do not load if not in `can_load` state
             load_spec = None
 
-        return ReqMeta(token_ids, slot_mapping, load_spec)
+        return ReqMeta(token_ids, slot_mapping_full, load_spec)
 
 
 @dataclass
@@ -181,9 +213,13 @@ class LMCacheConnectorMetadata(KVConnectorMetadata):
     def add_request(self,
                     request: "Request",
                     block_size: int,
-                    load_spec: Optional[LoadSpec] = None) -> None:
-        self.requests.append(
-            ReqMeta.from_request(request, block_size, load_spec))
+                    req_tokens: TokensTracker,
+                    chunk_size: int = 256,
+                    load_spec: Optional[LoadSpec] = None,
+                    ) -> None:
+        req_meta = ReqMeta.from_request(request, block_size, req_tokens, chunk_size, load_spec)
+        if req_meta is not None:
+            self.requests.append(req_meta)
 
 
 class LMCacheConnectorV1(KVConnectorBase_V1):
@@ -213,6 +249,12 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
         self.load_specs: dict[str, LoadSpec] = {}
 
         self.kv_cache_manager: Optional[KVCacheManager] = None
+        
+        # request_id -> full_token_ids
+        self.tokens_tracker: dict[str, TokensTracker] = {}
+        
+        # TODO: need to align this chunk size with lmcache
+        self.lmcache_chunk_size = 256
 
     def _init_kv_caches_from_forward_context(
             self, forward_context: "ForwardContext"):
@@ -343,7 +385,6 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
 
             # TODO: have a pre-allocated buffer to hold the slot_mappings
             slot_mapping = slot_mapping.cuda()
-
             skip_leading_tokens = self.lmcache_engine.lookup(token_ids)
             if skip_leading_tokens == len(token_ids):
                 continue  # skip this request
@@ -438,7 +479,7 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
             return
 
         self.load_specs[request.request_id].can_load = True
-
+    
     def build_connector_meta(
             self, scheduler_output: SchedulerOutput) -> KVConnectorMetadata:
         """Attach the connector metadata to the request object.
@@ -451,7 +492,26 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
             scheduler_output (SchedulerOutput): the scheduler output object.
         """
         meta = LMCacheConnectorMetadata()
+        
+        for finished_req_id in scheduler_output.finished_req_ids:
+            self.tokens_tracker.pop(finished_req_id)
+        
         for request in scheduler_output.scheduled_new_reqs:
             load_spec = self.load_specs.pop(request.req_id, None)
-            meta.add_request(request, self._block_size, load_spec)
+            req_tokens = TokensTracker(
+                prompt_tokens=request.prompt_token_ids, 
+                decode_tokens=[])
+            self.tokens_tracker[request.req_id] = req_tokens
+            meta.add_request(
+                request, self._block_size, req_tokens, 
+                self.lmcache_chunk_size, load_spec)
+
+        for request in scheduler_output.scheduled_cached_reqs:
+            load_spec = self.load_specs.pop(request.req_id, None)
+            req_tokens = self.tokens_tracker[request.req_id]
+            req_tokens.update(request)
+            meta.add_request(
+                request, self._block_size, req_tokens, 
+                self.lmcache_chunk_size, load_spec)
+        
         return meta
