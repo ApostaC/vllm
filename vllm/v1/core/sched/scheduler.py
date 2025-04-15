@@ -397,7 +397,8 @@ class Scheduler(SchedulerInterface):
                 num_scheduled_tokens[request.request_id] = num_new_tokens
                 token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
-                request.num_computed_tokens = num_computed_tokens
+                request.num_computed_tokens = num_computed_tokens + \
+                    num_external_tokens
 
                 # Encoder-related.
                 if encoder_inputs_to_schedule:
@@ -478,7 +479,7 @@ class Scheduler(SchedulerInterface):
             structured_output_request_ids=structured_output_request_ids,
             grammar_bitmask=grammar_bitmask,
         )
-
+        
         # NOTE(Kuntai): this function is designed for multiple purposes:
         # 1. Plan the KV cache store
         # 2. Wrap up all the KV cache load / save ops into an opaque object
