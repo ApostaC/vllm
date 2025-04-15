@@ -119,8 +119,11 @@ class LoadSpec:
     vllm_cached_tokens: int
     # Number of tokens that are cached in LMCache
     lmcache_cached_tokens: int
-    # Whether the scheduler allow us to load the tokens
-    can_load: bool
+    # Number of tokens vLLM really want LMCache to load
+    # This is used to handle the vLLM fails to allocate
+    # enough blocks for LMCache to load and we want to
+    # avoid the memory out-of-bound access
+    lmcache_load_tokens: int
 
 
 @dataclass
@@ -160,14 +163,12 @@ class ReqMeta:
             logger.error("Num tokens: %d", valid_num_tokens)
             logger.error("Slot mapping: %s", str(slot_mapping))
             logger.error("Slot mapping len: %s", len(slot_mapping))
-
-        if load_spec is not None and load_spec.can_load:
-            logger.debug("Scheduled to load %d tokens for request %s",
-                         load_spec.lmcache_cached_tokens, request.req_id)
-        else:
-            # Do not load if not in `can_load` state
-            load_spec = None
-
+        if load_spec is not None and len(
+                slot_mapping) < load_spec.lmcache_load_tokens:
+            logger.error("The slot mapping is shorter than the "
+                         "load spec! Which may access out-of-bound memory!")
+            logger.error("Slot mapping length: %d", len(slot_mapping))
+            logger.error("Load spec: %s", str(load_spec))
         return ReqMeta(token_ids, slot_mapping, load_spec)
 
 
@@ -286,6 +287,8 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
             num_retrieved_tokens = ret_token_mask.sum().item()
             num_expected_tokens = request.load_spec.lmcache_cached_tokens - \
                     request.load_spec.vllm_cached_tokens
+            logger.info("Worker LMCache retrieved %d tokens",
+                        num_retrieved_tokens)
             if num_retrieved_tokens < num_expected_tokens:
                 logger.error(
                     "The number of retrieved tokens is less than the "
@@ -383,33 +386,25 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
 
         token_ids = torch.tensor(request.prompt_token_ids)
         num_external_hit_tokens = self.lookup_client.lookup(token_ids)
+        #logger.info("Num external hit tokens: %d", num_external_hit_tokens)
 
-        # When prompt length is divisible by the block size and all
-        # blocks are cached, we need to recompute the last token.
-        # This will be removed in the future if vLLM's scheduler provides
-        # a better support for this case.
+        # HACK: back-off one token if there is a full-hit
         if num_external_hit_tokens == request.num_tokens:
             num_external_hit_tokens -= 1
 
         need_to_allocate = num_external_hit_tokens - num_computed_tokens
-
         logger.info(
-            "Reqid: %s, Total tokens %d, LMCache hit tokens: %d, "
-            "need to load: %d", request.request_id, request.num_tokens,
-            num_external_hit_tokens, need_to_allocate)
-
+            "Reqid %s, total tokens %d, "
+            "LMCache hit tokens %d, need to load %d", request.request_id,
+            request.num_tokens, num_external_hit_tokens, need_to_allocate)
         if need_to_allocate <= 0:
             return 0
-
         self.load_specs[request.request_id] = LoadSpec(
             vllm_cached_tokens=num_computed_tokens,
             lmcache_cached_tokens=num_external_hit_tokens,
-            can_load=False)
-
-        # TODO: Align to vLLM block size. Should test whether it can be removed
-        #need_to_allocate = need_to_allocate // self._block_size * \
-        #        self._block_size
-
+            lmcache_load_tokens=num_external_hit_tokens)
+        need_to_allocate = need_to_allocate // self._block_size * \
+                self._block_size
         return need_to_allocate
 
     def update_state_after_alloc(self, request: "Request",
@@ -424,20 +419,9 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
             # No KV tokens from external KV cache, return
             return
 
-        assert num_external_tokens == \
-            self.load_specs[request.request_id].lmcache_cached_tokens - \
-            self.load_specs[request.request_id].vllm_cached_tokens, \
-            f"Mismatch in number of tokens: {num_external_tokens} vs " \
-            f"{self.load_specs[request.request_id].lmcache_cached_tokens} - " \
-            f"{self.load_specs[request.request_id].vllm_cached_tokens}" \
-            f" for request {request.request_id}"
-
-        if num_external_tokens == 0:
-            # No need to load anything
-            self.load_specs[request.request_id].can_load = False
-            return
-
-        self.load_specs[request.request_id].can_load = True
+        vllm_cached = self.load_specs[request.request_id].vllm_cached_tokens
+        self.load_specs[request.request_id].lmcache_load_tokens = \
+                vllm_cached + num_external_tokens
 
     def build_connector_meta(
             self, scheduler_output: SchedulerOutput) -> KVConnectorMetadata:
@@ -450,6 +434,14 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
         Args:
             scheduler_output (SchedulerOutput): the scheduler output object.
         """
+        # Free the temp blocks
+        #if self.kv_cache_manager is not None:
+        #    blocks = self.kv_cache_manager.req_to_blocks.pop(
+        #            "temp-req-id-for-connector", [])
+        #    self.kv_cache_manager.block_pool.free_blocks(reversed(blocks))
+        #    self.kv_cache_manager.num_cached_block.pop(
+        #            "temp-req-id-for-connector", None)
+
         meta = LMCacheConnectorMetadata()
         for request in scheduler_output.scheduled_new_reqs:
             load_spec = self.load_specs.pop(request.req_id, None)
