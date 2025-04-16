@@ -125,6 +125,14 @@ class LoadSpec:
 
 
 @dataclass
+class SaveSpec:
+    # Skip already saved tokens
+    skip_leading_tokens: int
+    # Whether the scheduler allow us to save the tokens
+    can_save: bool
+
+
+@dataclass
 class RequestTracker:
     # Request id
     req_id: str
@@ -175,12 +183,14 @@ class RequestTracker:
 
 @dataclass
 class ReqMeta:
+    # Request id
+    req_id: str
     # Request tokens
     token_ids: torch.Tensor
     # Slot mapping
     slot_mapping: torch.Tensor
     # Skip save or not
-    skip_save: bool = False
+    save_spec: Optional[SaveSpec] = None
     # load_spec
     load_spec: Optional[LoadSpec] = None
 
@@ -229,12 +239,14 @@ class ReqMeta:
         # For save operation: do not save if the following condition is met
         # 1. has already been saved before (num_saved_tokens > 0)
         # 2. number of unsaved tokens is not reached the chunk boundary
+        skip_leading_tokens = tracker.num_saved_tokens
         chunk_boundary = cdiv(tracker.num_saved_tokens, lmcache_chunk_size) * \
                 lmcache_chunk_size
         skip_save = tracker.num_saved_tokens > 0 and \
                 len(token_ids) < chunk_boundary
         if not skip_save:
             tracker.num_saved_tokens = len(token_ids)
+        save_spec = SaveSpec(skip_leading_tokens, not skip_save)
 
         # For load operation: check whether the request is scheduled to load
         if load_spec is not None and load_spec.can_load:
@@ -245,9 +257,10 @@ class ReqMeta:
             load_spec = None
 
         return ReqMeta(
+            req_id=tracker.req_id,
             token_ids=token_ids,
             slot_mapping=slot_mapping,
-            skip_save=skip_save,
+            save_spec=save_spec,
             load_spec=load_spec,
         )
 
@@ -420,8 +433,12 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
         assert len(self.kv_caches) > 0
         kvcaches = list(self.kv_caches.values())
 
+        # HACK: getting chunk size to correctly calculate store mask
+        lmcache_chunk_size = self.lmcache_engine.config.chunk_size
+
         for request in connector_metadata.requests:
-            if request.skip_save:
+            save_spec = request.save_spec
+            if save_spec is None or not save_spec.can_save:
                 continue
 
             token_ids = request.token_ids
@@ -434,15 +451,25 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
 
             # TODO: have a pre-allocated buffer to hold the slot_mappings
             slot_mapping = slot_mapping.cuda()
-            skip_leading_tokens = self.lmcache_engine.lookup(token_ids)
+            # NOTE: In PD setting, lmcache_engine.lookup() will always return
+            # 0 if there is no local storage configured. In this case, we
+            # should rely on the slip_leading_tokens in save_spec to avoid
+            # transmit the already saved tokens again.
+            skip_leading_tokens = max(self.lmcache_engine.lookup(token_ids),
+                                      save_spec.skip_leading_tokens)
             if skip_leading_tokens == len(token_ids):
                 continue  # skip this request
+            # Align to lmcache chunk size
+            skip_leading_tokens = skip_leading_tokens // \
+                    lmcache_chunk_size * lmcache_chunk_size
 
             store_mask = torch.ones_like(token_ids, dtype=torch.bool)
             store_mask[:skip_leading_tokens] = False
 
-            logger.info("Storing KV cache for %d out of %d tokens",
-                        len(token_ids) - skip_leading_tokens, len(token_ids))
+            logger.info(
+                "Storing KV cache for %d out of %d tokens for request %s",
+                len(token_ids) - skip_leading_tokens, len(token_ids),
+                request.req_id)
             self.lmcache_engine.store(token_ids,
                                       mask=store_mask,
                                       kvcaches=kvcaches,
