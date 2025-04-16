@@ -200,7 +200,7 @@ class ReqMeta:
         block_size: int,
         lmcache_chunk_size: int = 256,
         load_spec: Optional[LoadSpec] = None,
-    ) -> "ReqMeta":
+    ) -> Optional["ReqMeta"]:
         """Create the request metadata from a request tracker.
 
         Args:
@@ -217,7 +217,24 @@ class ReqMeta:
             This function will update `tracker.num_saved_tokens` if a save
             operation is needed.
         """
-        # Calculate the token ids and slot mappings
+        # For save operation: do not save if the following condition is met
+        # 1. has already been saved before (num_saved_tokens > 0)
+        # 2. number of unsaved tokens is not reached the chunk boundary
+        skip_leading_tokens = tracker.num_saved_tokens
+        chunk_boundary = cdiv(tracker.num_saved_tokens, lmcache_chunk_size) * \
+                lmcache_chunk_size
+        skip_save = tracker.num_saved_tokens > 0 and \
+                len(tracker.token_ids) < chunk_boundary
+
+        if skip_save and load_spec is None:
+            return None
+
+        # If we need to save, update the number of saved tokens
+        if not skip_save:
+            tracker.num_saved_tokens = len(tracker.token_ids)
+        save_spec = SaveSpec(skip_leading_tokens, not skip_save)
+
+        # Calculate the token ids and slot mappings for load and save
         token_ids = torch.tensor(tracker.token_ids)
         num_blocks = len(tracker.allocated_block_ids)
         block_ids = torch.tensor(tracker.allocated_block_ids, dtype=torch.long)
@@ -235,18 +252,6 @@ class ReqMeta:
 
         slot_mapping = slot_mapping.flatten()[:len(token_ids)]
         assert slot_mapping.dtype == torch.long  # TODO: this could be removed
-
-        # For save operation: do not save if the following condition is met
-        # 1. has already been saved before (num_saved_tokens > 0)
-        # 2. number of unsaved tokens is not reached the chunk boundary
-        skip_leading_tokens = tracker.num_saved_tokens
-        chunk_boundary = cdiv(tracker.num_saved_tokens, lmcache_chunk_size) * \
-                lmcache_chunk_size
-        skip_save = tracker.num_saved_tokens > 0 and \
-                len(token_ids) < chunk_boundary
-        if not skip_save:
-            tracker.num_saved_tokens = len(token_ids)
-        save_spec = SaveSpec(skip_leading_tokens, not skip_save)
 
         # For load operation: check whether the request is scheduled to load
         if load_spec is not None and load_spec.can_load:
@@ -528,7 +533,6 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
         # TODO: Align to vLLM block size. Should test whether it can be removed
         #need_to_allocate = need_to_allocate // self._block_size * \
         #        self._block_size
-
         return need_to_allocate
 
     def update_state_after_alloc(self, request: "Request",
@@ -587,7 +591,8 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
                                                     self._block_size,
                                                     self._lmcache_chunk_size,
                                                     load_spec)
-            meta.add_request(req_meta)
+            if req_meta is not None:
+                meta.add_request(req_meta)
 
         for request in scheduler_output.scheduled_cached_reqs:
             request_tracker = self._request_trackers[request.req_id]
@@ -597,6 +602,7 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
                                                     self._block_size,
                                                     self._lmcache_chunk_size,
                                                     None)
-            meta.add_request(req_meta)
+            if req_meta is not None:
+                meta.add_request(req_meta)
 
         return meta
