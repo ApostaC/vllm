@@ -195,12 +195,11 @@ class ReqMeta:
     load_spec: Optional[LoadSpec] = None
 
     @staticmethod
-    def from_request_tracker(
-        tracker: RequestTracker,
-        block_size: int,
-        lmcache_chunk_size: int = 256,
-        load_spec: Optional[LoadSpec] = None,
-    ) -> Optional["ReqMeta"]:
+    def from_request_tracker(tracker: RequestTracker,
+                             block_size: int,
+                             lmcache_chunk_size: int = 256,
+                             load_spec: Optional[LoadSpec] = None,
+                             skip_save: bool = False) -> Optional["ReqMeta"]:
         """Create the request metadata from a request tracker.
 
         Args:
@@ -208,6 +207,7 @@ class ReqMeta:
             block_size (int): the block size in vLLM.
             lmcache_chunk_size (int): the chunk size for LMCache.
             load_spec (Optional[LoadSpec]): the load spec for KV cache loading.
+            skip_save (bool): whether to skip the save operation.
 
         Returns:
             the request metadata if we need to perform load/save 
@@ -217,25 +217,35 @@ class ReqMeta:
             This function will update `tracker.num_saved_tokens` if a save
             operation is needed.
         """
+        input_token_ids = tracker.token_ids
+        input_token_len = len(input_token_ids)
+
         # For save operation: do not save if the following condition is met
         # 1. has already been saved before (num_saved_tokens > 0)
         # 2. number of unsaved tokens is not reached the chunk boundary
         skip_leading_tokens = tracker.num_saved_tokens
         chunk_boundary = cdiv(tracker.num_saved_tokens, lmcache_chunk_size) * \
                 lmcache_chunk_size
-        skip_save = tracker.num_saved_tokens > 0 and \
-                len(tracker.token_ids) < chunk_boundary
+        skip_save = skip_save or (tracker.num_saved_tokens > 0 and \
+                input_token_len < chunk_boundary)
 
         if skip_save and load_spec is None:
             return None
 
+        # HACK: discard partial chunks
+        #num_tokens_to_save = input_token_len
+        num_tokens_to_save = input_token_len // lmcache_chunk_size * \
+                lmcache_chunk_size
+
         # If we need to save, update the number of saved tokens
         if not skip_save:
-            tracker.num_saved_tokens = len(tracker.token_ids)
+            tracker.num_saved_tokens = num_tokens_to_save
         save_spec = SaveSpec(skip_leading_tokens, not skip_save)
 
         # Calculate the token ids and slot mappings for load and save
-        token_ids = torch.tensor(tracker.token_ids)
+        # OPTIMIZATION: pre-allocate the buffer for token ids and block
+        # ids
+        token_ids = torch.tensor(input_token_ids)[:num_tokens_to_save]
         num_blocks = len(tracker.allocated_block_ids)
         block_ids = torch.tensor(tracker.allocated_block_ids, dtype=torch.long)
 
@@ -316,6 +326,11 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
 
         # request_id -> full_token_ids
         self._request_trackers: dict[str, RequestTracker] = {}
+
+        # Whether to discard partial chunks
+        self._discard_partial_chunks = vllm_config.\
+                kv_transfer_config.get_from_extra_config(
+                    "discard_partial_chunks", True)
 
         # TODO: need to align this chunk size with lmcache
         self._lmcache_chunk_size = 256
@@ -454,6 +469,12 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
             assert isinstance(slot_mapping, torch.Tensor)
             assert len(slot_mapping) == len(token_ids)
 
+            ## HACK: discard partial chunks
+            #num_after_discard = len(token_ids) // lmcache_chunk_size * \
+            #        lmcache_chunk_size
+            #token_ids = token_ids[:num_after_discard]
+            #slot_mapping = slot_mapping[:num_after_discard]
+
             # TODO: have a pre-allocated buffer to hold the slot_mappings
             slot_mapping = slot_mapping.cuda()
             # NOTE: In PD setting, lmcache_engine.lookup() will always return
@@ -573,6 +594,8 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
         Args:
             scheduler_output (SchedulerOutput): the scheduler output object.
         """
+        force_skip_save = self.kv_role == "kv_consumer"
+
         meta = LMCacheConnectorMetadata()
 
         for finished_req_id in scheduler_output.finished_req_ids:
@@ -590,7 +613,8 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
             req_meta = ReqMeta.from_request_tracker(request_tracker,
                                                     self._block_size,
                                                     self._lmcache_chunk_size,
-                                                    load_spec)
+                                                    load_spec=load_spec,
+                                                    skip_save=force_skip_save)
             if req_meta is not None:
                 meta.add_request(req_meta)
 
@@ -601,7 +625,8 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
             req_meta = ReqMeta.from_request_tracker(request_tracker,
                                                     self._block_size,
                                                     self._lmcache_chunk_size,
-                                                    None)
+                                                    load_spec=None,
+                                                    skip_save=force_skip_save)
             if req_meta is not None:
                 meta.add_request(req_meta)
 
