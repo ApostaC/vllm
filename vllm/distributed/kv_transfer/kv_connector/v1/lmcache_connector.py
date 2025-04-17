@@ -1,5 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-import os
 import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
@@ -28,39 +27,28 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-# FIXME: Use a different way to generate the rpc path in order
-# to avoid cross-vllm instance conflict
-def determine_shared_pid(role: KVConnectorRole, is_tp: bool):
-    # If TP:
-    # - scheduler: use pid
-    # - worker: use ppid
-    # If non-TP:
-    # - scheduler: use ppid
-    # - worker: use ppid
-    # TODO: Change the hacky logic and have a better way
-    # to generate the rpc path
-    if is_tp:
-        return os.getpid(
-        ) if role == KVConnectorRole.SCHEDULER else os.getppid()
-    else:
-        return os.getppid()
-
-
-def get_zmq_rpc_path_lmcache(role: KVConnectorRole,
-                             is_tp: bool = False) -> str:
-    shared_pid = determine_shared_pid(role, is_tp)
+def get_zmq_rpc_path_lmcache(
+        role: KVConnectorRole,
+        is_tp: bool = False,
+        vllm_config: Optional["VllmConfig"] = None) -> str:
     base_url = envs.VLLM_RPC_BASE_PATH
-    logger.debug("Base URL: %s", base_url)
-    return f"ipc://{base_url}/lmcache_rpc_port_{shared_pid}"
+    # Default to 0 if not configured
+    rpc_port = 0
+    if vllm_config is not None:
+        rpc_port = vllm_config.kv_transfer_config.get_from_extra_config(
+            "lmcache_rpc_port", 0)
+    logger.debug("Base URL: %s, RPC Port: %d", base_url, rpc_port)
+    return f"ipc://{base_url}/lmcache_rpc_port_{rpc_port}"
 
 
 # TODO: move this to LMCache so that we can gracefully close it
 class LMCacheLookupClient:
 
-    def __init__(self, role: KVConnectorRole, is_tp: bool):
+    def __init__(self, role: KVConnectorRole, is_tp: bool,
+                 vllm_config: "VllmConfig"):
         self.encoder = MsgpackEncoder()
         self.ctx = zmq.Context()
-        socket_path = get_zmq_rpc_path_lmcache(role, is_tp)
+        socket_path = get_zmq_rpc_path_lmcache(role, is_tp, vllm_config)
         self.socket = make_zmq_socket(self.ctx,
                                       socket_path,
                                       zmq.REQ,
@@ -80,10 +68,10 @@ class LMCacheLookupClient:
 class LMCacheLookupServer:
 
     def __init__(self, lmcache_engine: LMCacheEngine, role: KVConnectorRole,
-                 is_tp: bool):
+                 is_tp: bool, vllm_config: "VllmConfig"):
         self.decoder = MsgpackDecoder(torch.Tensor)
         self.ctx = zmq.Context()
-        socket_path = get_zmq_rpc_path_lmcache(role, is_tp)
+        socket_path = get_zmq_rpc_path_lmcache(role, is_tp, vllm_config)
         self.socket = make_zmq_socket(self.ctx,
                                       socket_path,
                                       zmq.REP,
@@ -195,11 +183,14 @@ class ReqMeta:
     load_spec: Optional[LoadSpec] = None
 
     @staticmethod
-    def from_request_tracker(tracker: RequestTracker,
-                             block_size: int,
-                             lmcache_chunk_size: int = 256,
-                             load_spec: Optional[LoadSpec] = None,
-                             skip_save: bool = False) -> Optional["ReqMeta"]:
+    def from_request_tracker(
+        tracker: RequestTracker,
+        block_size: int,
+        lmcache_chunk_size: int = 256,
+        load_spec: Optional[LoadSpec] = None,
+        skip_save: bool = False,
+        discard_partial_chunks: bool = True,
+    ) -> Optional["ReqMeta"]:
         """Create the request metadata from a request tracker.
 
         Args:
@@ -208,14 +199,11 @@ class ReqMeta:
             lmcache_chunk_size (int): the chunk size for LMCache.
             load_spec (Optional[LoadSpec]): the load spec for KV cache loading.
             skip_save (bool): whether to skip the save operation.
+            discard_partial_chunks (bool): whether to discard partial chunks.
 
         Returns:
             the request metadata if we need to perform load/save 
             operations, None otherwise.
-
-        Side effects:
-            This function will update `tracker.num_saved_tokens` if a save
-            operation is needed.
         """
         input_token_ids = tracker.token_ids
         input_token_len = len(input_token_ids)
@@ -232,10 +220,11 @@ class ReqMeta:
         if skip_save and load_spec is None:
             return None
 
-        # HACK: discard partial chunks
-        #num_tokens_to_save = input_token_len
-        num_tokens_to_save = input_token_len // lmcache_chunk_size * \
-                lmcache_chunk_size
+        # Calculate number of tokens to save based on discard_partial_chunks
+        # setting
+        num_tokens_to_save = (
+            input_token_len // lmcache_chunk_size *
+            lmcache_chunk_size) if discard_partial_chunks else input_token_len
 
         # If we need to save, update the number of saved tokens
         if not skip_save:
@@ -304,7 +293,7 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
         self.kv_role = vllm_config.kv_transfer_config.kv_role
         is_tp = vllm_config.parallel_config.tensor_parallel_size > 1
         if role == KVConnectorRole.SCHEDULER:
-            self.lookup_client = LMCacheLookupClient(role, is_tp)
+            self.lookup_client = LMCacheLookupClient(role, is_tp, vllm_config)
         else:
             self.lmcache_engine = init_lmcache_engine(
                 vllm_config.model_config, vllm_config.parallel_config,
@@ -313,7 +302,7 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
             # when there are multiple workers
             if vllm_config.parallel_config.rank == 0:
                 self.lookup_server = LMCacheLookupServer(
-                    self.lmcache_engine, role, is_tp)
+                    self.lmcache_engine, role, is_tp, vllm_config)
 
         self.kv_caches: dict[str, torch.Tensor] = {}
 
@@ -328,9 +317,9 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
         self._request_trackers: dict[str, RequestTracker] = {}
 
         # Whether to discard partial chunks
-        self._discard_partial_chunks = vllm_config.\
-                kv_transfer_config.get_from_extra_config(
-                    "discard_partial_chunks", True)
+        self._discard_partial_chunks = vllm_config\
+                .kv_transfer_config.get_from_extra_config(
+                    "discard_partial_chunks", False)
 
         # TODO: need to align this chunk size with lmcache
         self._lmcache_chunk_size = 256
@@ -469,12 +458,6 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
             assert isinstance(slot_mapping, torch.Tensor)
             assert len(slot_mapping) == len(token_ids)
 
-            ## HACK: discard partial chunks
-            #num_after_discard = len(token_ids) // lmcache_chunk_size * \
-            #        lmcache_chunk_size
-            #token_ids = token_ids[:num_after_discard]
-            #slot_mapping = slot_mapping[:num_after_discard]
-
             # TODO: have a pre-allocated buffer to hold the slot_mappings
             slot_mapping = slot_mapping.cuda()
             # NOTE: In PD setting, lmcache_engine.lookup() will always return
@@ -610,11 +593,13 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
                 request, num_tokens_to_compute)
             self._request_trackers[request.req_id] = request_tracker
 
-            req_meta = ReqMeta.from_request_tracker(request_tracker,
-                                                    self._block_size,
-                                                    self._lmcache_chunk_size,
-                                                    load_spec=load_spec,
-                                                    skip_save=force_skip_save)
+            req_meta = ReqMeta.from_request_tracker(
+                request_tracker,
+                self._block_size,
+                self._lmcache_chunk_size,
+                load_spec=load_spec,
+                skip_save=force_skip_save,
+                discard_partial_chunks=self._discard_partial_chunks)
             if req_meta is not None:
                 meta.add_request(req_meta)
 
@@ -622,11 +607,13 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
             request_tracker = self._request_trackers[request.req_id]
             request_tracker.update(request)
 
-            req_meta = ReqMeta.from_request_tracker(request_tracker,
-                                                    self._block_size,
-                                                    self._lmcache_chunk_size,
-                                                    load_spec=None,
-                                                    skip_save=force_skip_save)
+            req_meta = ReqMeta.from_request_tracker(
+                request_tracker,
+                self._block_size,
+                self._lmcache_chunk_size,
+                load_spec=None,
+                skip_save=force_skip_save,
+                discard_partial_chunks=self._discard_partial_chunks)
             if req_meta is not None:
                 meta.add_request(req_meta)
 
