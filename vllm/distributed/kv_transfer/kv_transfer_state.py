@@ -58,6 +58,9 @@ def ensure_kv_transfer_initialized(vllm_config: "VllmConfig") -> None:
     if vllm_config.kv_transfer_config is None:
         return
 
+    if vllm_config.kv_transfer_config.kv_connector is None:
+        return
+
     if (vllm_config.kv_transfer_config.is_kv_transfer_instance
             and _KV_CONNECTOR_AGENT is None):
         if envs.VLLM_USE_V1:

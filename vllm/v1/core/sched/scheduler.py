@@ -9,14 +9,19 @@ from collections import defaultdict
 from collections.abc import Iterable
 from typing import Any, Optional, Union
 
+import zmq
+
 from vllm.config import VllmConfig
 from vllm.distributed.kv_events import EventPublisherFactory, KVEventBatch
 from vllm.distributed.kv_transfer.kv_connector.factory import (
     KVConnectorFactory)
 from vllm.distributed.kv_transfer.kv_connector.v1 import (KVConnectorBase_V1,
                                                           KVConnectorRole)
+from vllm.kvserver.protocol import (send_offload_request,
+                                    send_scheduler_handshake)
 from vllm.logger import init_logger
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
+from vllm.utils import make_zmq_path, make_zmq_socket
 from vllm.v1.core.encoder_cache_manager import (EncoderCacheManager,
                                                 compute_encoder_budget)
 from vllm.v1.core.kv_cache_manager import KVCacheManager
@@ -79,7 +84,8 @@ class Scheduler(SchedulerInterface):
         # will have a corresponding KVConnector with Role=WORKER.
         # KV Connector pushes/pull of remote KVs for P/D and offloading.
         self.connector = None
-        if self.vllm_config.kv_transfer_config is not None:
+        if self.vllm_config.kv_transfer_config is not None and \
+                self.vllm_config.kv_transfer_config.kv_connector is not None:
             assert len(self.kv_cache_config.kv_cache_groups) == 1, (
                 "Multiple KV cache groups are not currently supported "
                 "with KV connectors")
@@ -158,6 +164,21 @@ class Scheduler(SchedulerInterface):
             enable_kv_cache_events=self.enable_kv_cache_events,
         )
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
+
+        # KV server related
+        self.kv_server_socket: Optional[zmq.Socket] = None
+        if vllm_config.kv_transfer_config is not None and \
+            vllm_config.kv_transfer_config.kv_server_port is not None:
+            # Establish connection to KV server
+            kv_server_addr = make_zmq_path(
+                "tcp", "localhost",
+                vllm_config.kv_transfer_config.kv_server_port)
+            self.kv_server_context = zmq.Context()
+            self.kv_server_socket = make_zmq_socket(self.kv_server_context,
+                                                    kv_server_addr,
+                                                    zmq.DEALER,
+                                                    bind=False)
+            send_scheduler_handshake(self.kv_server_socket)
 
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
@@ -752,7 +773,8 @@ class Scheduler(SchedulerInterface):
                                      pooler_output)
 
             if stopped:
-                kv_transfer_params = self._free_request(request)
+                # NOTE: delay the _free_request
+                #kv_transfer_params = self._free_request(request)
                 if status_before_stop == RequestStatus.RUNNING:
                     stopped_running_reqs.add(request)
                 else:
@@ -813,13 +835,26 @@ class Scheduler(SchedulerInterface):
 
         # Remove the stopped requests from the running and waiting queues.
         if stopped_running_reqs:
+            if self.kv_server_socket is not None:
+                # Notify the KV server that these requests are finished.
+                for req in stopped_running_reqs:
+                    send_offload_request(
+                        self.kv_server_socket, req.request_id,
+                        list(req.all_token_ids),
+                        self.kv_cache_manager.get_block_ids(req.request_id))
             self.running = [
                 req for req in self.running if req not in stopped_running_reqs
             ]
+            for req in stopped_preempted_reqs:
+                self._free_request(req)
+
         if stopped_preempted_reqs:
             # This is a rare case and unlikely to impact performance.
             self.waiting.remove_requests(stopped_preempted_reqs)
+            for req in stopped_preempted_reqs:
+                self._free_request(req)
 
+        # TODO(ApostaC): add a _post_schedule to process the finished requests!
         # Create EngineCoreOutputs for all clients that have requests with
         # outputs in this step.
         engine_core_outputs = {

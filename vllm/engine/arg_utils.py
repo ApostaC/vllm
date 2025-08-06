@@ -445,6 +445,8 @@ class EngineArgs:
     # DEPRECATED
     enable_prompt_adapter: bool = False
 
+    # KV server
+
     def __post_init__(self):
         # support `EngineArgs(compilation_config={...})`
         # without having to manually construct a

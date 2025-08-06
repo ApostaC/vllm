@@ -10,6 +10,7 @@ import numpy as np
 import torch
 import torch.distributed
 import torch.nn as nn
+import zmq
 from tqdm import tqdm
 
 import vllm.envs as envs
@@ -26,6 +27,7 @@ from vllm.distributed.parallel_state import (
     get_pp_group, get_tp_group, graph_capture, is_global_first_rank,
     prepare_communication_buffer_for_model)
 from vllm.forward_context import DPMetadata, set_forward_context
+from vllm.kvserver.protocol import send_worker_handshake
 from vllm.logger import init_logger
 from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaBase
 from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
@@ -43,7 +45,8 @@ from vllm.sequence import IntermediateTensors, PoolerOutput
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
 from vllm.utils import (STR_DTYPE_TO_TORCH_DTYPE, DeviceMemoryProfiler,
                         GiB_bytes, LazyLoader, check_use_alibi, get_dtype_size,
-                        is_pin_memory_available, round_up)
+                        is_pin_memory_available, make_zmq_path,
+                        make_zmq_socket, round_up)
 from vllm.v1.attention.backends.mamba_selectors import get_mamba_attn_backend
 from vllm.v1.attention.backends.utils import (
     AttentionMetadataBuilder, CommonAttentionMetadata,
@@ -320,6 +323,20 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # means this layer will perform attention using the keys and values
         # from the KV cache of `shared_kv_cache_layers[layer_name]`.
         self.shared_kv_cache_layers: dict[str, str] = {}
+
+        # KV server
+        self.kv_server_socket: Optional[zmq.Socket] = None
+        if vllm_config.kv_transfer_config is not None and \
+            vllm_config.kv_transfer_config.kv_server_port is not None:
+            # Establish connection to KV server
+            kv_server_addr = make_zmq_path(
+                "tcp", "localhost",
+                vllm_config.kv_transfer_config.kv_server_port)
+            self.kv_server_context = zmq.Context()
+            self.kv_server_socket = make_zmq_socket(self.kv_server_context,
+                                                    kv_server_addr,
+                                                    zmq.DEALER,
+                                                    bind=False)
 
     def _may_reorder_batch(self, scheduler_output: "SchedulerOutput") -> None:
         """
@@ -2826,6 +2843,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         if has_kv_transfer_group():
             get_kv_transfer_group().register_kv_caches(kv_caches)
+
+        if self.kv_server_socket is not None:
+            send_worker_handshake(self.kv_server_socket,
+                                  self.vllm_config.parallel_config.rank,
+                                  self.vllm_config.parallel_config.world_size,
+                                  self.kv_caches)
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """

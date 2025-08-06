@@ -3932,6 +3932,9 @@ class KVTransferConfig:
     """The Python module path to dynamically load the KV connector from.
     Only supported in V1."""
 
+    kv_server_port: Optional[int] = None
+    """The port of the KV server."""
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
